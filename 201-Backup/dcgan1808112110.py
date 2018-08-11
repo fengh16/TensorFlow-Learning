@@ -24,11 +24,14 @@ from six.moves import xrange
 import time
 import scipy.misc
 
+# 层的一些定义
+
 image_summary = tf.summary.image
 scalar_summary = tf.summary.scalar
 histogram_summary = tf.summary.histogram
 merge_summary = tf.summary.merge
 SummaryWriter = tf.summary.FileWriter
+
 
 class batch_norm(object):
     def __init__(self, epsilon=1e-5, momentum=0.9, name="batch_norm"):
@@ -47,17 +50,108 @@ class batch_norm(object):
                                             scope=self.name)
 
 
+def conv2d(input_, output_dim,
+           k_h=5, k_w=5, d_h=2, d_w=2, stddev=0.02,
+           name="conv2d"):
+    with tf.variable_scope(name):
+        w = tf.get_variable('w', [k_h, k_w, input_.get_shape()[-1], output_dim],
+                            initializer=tf.truncated_normal_initializer(stddev=stddev))
+        conv = tf.nn.conv2d(input_, w, strides=[1, d_h, d_w, 1], padding='SAME')
+
+        biases = tf.get_variable('biases', [output_dim], initializer=tf.constant_initializer(0.0))
+        conv = tf.reshape(tf.nn.bias_add(conv, biases), conv.get_shape())
+
+        return conv
+
+
+def deconv2d(input_, output_shape,
+             k_h=5, k_w=5, d_h=2, d_w=2, stddev=0.02,
+             name="deconv2d", with_w=False):
+    with tf.variable_scope(name):
+        # filter : [height, width, output_channels, in_channels]
+        w = tf.get_variable('w', [k_h, k_w, output_shape[-1], input_.get_shape()[-1]],
+                            initializer=tf.random_normal_initializer(stddev=stddev))
+
+        try:
+            deconv = tf.nn.conv2d_transpose(input_, w, output_shape=output_shape,
+                                            strides=[1, d_h, d_w, 1])
+
+        # Support for verisons of TensorFlow before 0.7.0
+        except AttributeError:
+            deconv = tf.nn.deconv2d(input_, w, output_shape=output_shape,
+                                    strides=[1, d_h, d_w, 1])
+
+        biases = tf.get_variable('biases', [output_shape[-1]], initializer=tf.constant_initializer(0.0))
+        deconv = tf.reshape(tf.nn.bias_add(deconv, biases), deconv.get_shape())
+
+        if with_w:
+            return deconv, w, biases
+        else:
+            return deconv
+
+
+def lrelu(x, leak=0.2, name="lrelu"):
+    return tf.maximum(x, leak * x)
+
+
+def linear(input_, output_size, scope=None, stddev=0.02, bias_start=0.0, with_w=False):
+    shape = input_.get_shape().as_list()
+
+    with tf.variable_scope(scope or "Linear"):
+        matrix = tf.get_variable("Matrix", [shape[1], output_size], tf.float32,
+                                 tf.random_normal_initializer(stddev=stddev))
+        bias = tf.get_variable("bias", [output_size],
+                               initializer=tf.constant_initializer(bias_start))
+        if with_w:
+            return tf.matmul(input_, matrix) + bias, matrix, bias
+        else:
+            return tf.matmul(input_, matrix) + bias
+
+
+def merge(images, size):
+    h, w = images.shape[1], images.shape[2]
+    if (images.shape[3] in (3, 4)):
+        c = images.shape[3]
+        img = np.zeros((h * size[0], w * size[1], c))
+        for idx, image in enumerate(images):
+            i = idx % size[1]
+            j = idx // size[1]
+            img[j * h:j * h + h, i * w:i * w + w, :] = image
+        return img
+    elif images.shape[3] == 1:
+        img = np.zeros((h * size[0], w * size[1]))
+        for idx, image in enumerate(images):
+            i = idx % size[1]
+            j = idx // size[1]
+            img[j * h:j * h + h, i * w:i * w + w] = image[:, :, 0]
+        return img
+    else:
+        raise ValueError('in merge(images,size) images parameter '
+                         'must have dimensions: HxW or HxWx3 or HxWx4')
+
+
+def image_manifold_size(num_images):
+    manifold_h = int(np.floor(np.sqrt(num_images)))
+    manifold_w = int(np.ceil(np.sqrt(num_images)))
+    assert manifold_h * manifold_w == num_images
+    return manifold_h, manifold_w
+
+
+def imsave(images, size, path):
+    image = np.squeeze(merge(images, size))
+    return scipy.misc.imsave(path, image)
+
 
 class DCGAN:
-    def __init__(self, path=r'../common/getchu_faces_64/', input_h=64, input_w=64, batch_size=64, gf_dim=128,
-                 df_dim=64, z_dim=100, c_dim=3, checkpoint_dir='checkpoint',
+    def __init__(self, path=r'../common/getchu_faces_64/', input_h=64, input_w=64, batch_size=64, gf_dim=64,
+                 df_dim=64, gfc_dim=1024, dfc_dim=1024, z_dim=100, c_dim=3, checkpoint_dir='checkpoint',
                  sample_num=64, learning_rate=0.0002, beta1=0.5, epoch=400):
         # load Data
         self.sess = tf.Session()
         self.images = []
         self.image_h, self.image_w, self.batch_size = input_h, input_w, batch_size
-        self.gf_dim, self.df_dim, self.c_dim, self.z_dim = \
-            gf_dim, df_dim, c_dim, z_dim
+        self.gf_dim, self.df_dim, self.gfc_dim, self.dfc_dim, self.c_dim, self.z_dim = \
+            gf_dim, df_dim, gfc_dim, dfc_dim, c_dim, z_dim
         self.sample_num, self.learning_rate, self.beta1, self.epoch = \
             sample_num, learning_rate, beta1, epoch
         self.checkpoint_dir = checkpoint_dir
@@ -65,7 +159,7 @@ class DCGAN:
         self.imagefiles = os.listdir(path)
         np.random.shuffle(self.imagefiles)
         if WINDOWS:
-            self.imagefiles = self.imagefiles[:500]
+            self.imagefiles = self.imagefiles[:2000]
         for index, i in enumerate(self.imagefiles):
             data = tf.image.decode_jpeg(tf.gfile.FastGFile(os.path.join(path, i), 'rb').read())
             data = tf.image.convert_image_dtype(data, dtype=tf.uint8)
@@ -123,33 +217,32 @@ class DCGAN:
                 batch = self.images[idx * self.batch_size:(idx + 1) * self.batch_size]
                 batch_images = np.array(batch).astype(np.float32)
 
-                batch_z = np.random.uniform(-1, 1, [self.batch_size, self.z_dim]).astype(np.float32)
+                batch_z = np.random.uniform(-1, 1, [self.batch_size, self.z_dim]) \
+                    .astype(np.float32)
 
-                def trainD():
-                    _, summary_str = self.sess.run([d_optim, self.d_sum],
-                                                   feed_dict={self.inputs: batch_images, self.z: batch_z})
-                    self.writer.add_summary(summary_str, counter)
+                # Update D network
+                _, summary_str = self.sess.run([d_optim, self.d_sum],
+                                               feed_dict={self.inputs: batch_images, self.z: batch_z})
+                self.writer.add_summary(summary_str, counter)
 
-                def trainG():
-                    _, summary_str = self.sess.run([g_optim, self.g_sum],
-                                                   feed_dict={self.z: batch_z})
-                    self.writer.add_summary(summary_str, counter)
+                # Update G network
+                _, summary_str = self.sess.run([g_optim, self.g_sum],
+                                               feed_dict={self.z: batch_z})
+                self.writer.add_summary(summary_str, counter)
 
-                trainD()
-                trainG()
-                trainG() # 两次应该能好一点……要不然就崩了
+                # Run g_optim twice to make sure that d_loss does not go to zero (different from paper)
+                _, summary_str = self.sess.run([g_optim, self.g_sum],
+                                               feed_dict={self.z: batch_z})
+                self.writer.add_summary(summary_str, counter)
 
                 errD_fake = self.d_loss_fake.eval({self.z: batch_z})
                 errD_real = self.d_loss_real.eval({self.inputs: batch_images})
                 errG = self.g_loss.eval({self.z: batch_z})
 
-                if errG > (errD_fake + errD_real) * 2:
-                    trainG()
-                    trainG()
-
                 counter += 1
                 print("Epoch: [%2d] [%4d/%4d] time: %4.4f, d_loss: %.8f, g_loss: %.8f" \
-                      % (epoch, idx, batch_idxs, time.time() - start_time, errD_fake + errD_real, errG))
+                      % (epoch, idx, batch_idxs,
+                         time.time() - start_time, errD_fake + errD_real, errG))
 
                 if np.mod(counter, 100) == 1 and counter > 100:
                     try:
@@ -160,20 +253,9 @@ class DCGAN:
                                 self.inputs: sample_inputs,
                             },
                         )
-
-                        num_images = samples.shape[0]
-                        images = (samples + 1.) / 2
-                        size = (int(np.floor(np.sqrt(num_images))), int(np.ceil(np.sqrt(num_images))))
-                        h, w = images.shape[1], images.shape[2]
-                        img = np.zeros((h * size[0], w * size[1], self.c_dim))
-                        for idx, image in enumerate(images):
-                            i = idx % size[1]
-                            j = idx // size[1]
-                            img[j * h:j * h + h, i * w:i * w + w, :] = image
-
-                        scipy.misc.imsave('train_{:03d}_{:03d}.png'.format(epoch, idx), np.squeeze(img))
+                        imsave((samples + 1.) / 2, image_manifold_size(samples.shape[0]),
+                               'train_{:02d}_{:04d}.png'.format(epoch, idx))
                         print("[Sample] d_loss: %.8f, g_loss: %.8f" % (d_loss, g_loss))
-
                     except:
                         print("one pic error!...")
 
@@ -182,56 +264,6 @@ class DCGAN:
 
     def half(self, num):
         return int(np.ceil(num / 2))
-
-    def conv2d(self, input_, output_dim, k_h=5, k_w=5, d_h=2, d_w=2, stddev=0.02, name="conv2d"):
-        with tf.variable_scope(name):
-            w = tf.get_variable('w', [k_h, k_w, input_.get_shape()[-1], output_dim],
-                                initializer=tf.truncated_normal_initializer(stddev=stddev))
-            conv = tf.nn.conv2d(input_, w, strides=[1, d_h, d_w, 1], padding='SAME')
-
-            biases = tf.get_variable('biases', [output_dim], initializer=tf.constant_initializer(0.0))
-            conv = tf.reshape(tf.nn.bias_add(conv, biases), conv.get_shape())
-
-            return conv
-
-    def deconv2d(self, input_, output_shape, k_h=5, k_w=5, d_h=2, d_w=2, stddev=0.02, name="deconv2d", with_w=False):
-        with tf.variable_scope(name):
-            # filter : [height, width, output_channels, in_channels]
-            w = tf.get_variable('w', [k_h, k_w, output_shape[-1], input_.get_shape()[-1]],
-                                initializer=tf.random_normal_initializer(stddev=stddev))
-
-            try:
-                deconv = tf.nn.conv2d_transpose(input_, w, output_shape=output_shape,
-                                                strides=[1, d_h, d_w, 1])
-
-            # Support for verisons of TensorFlow before 0.7.0
-            except AttributeError:
-                deconv = tf.nn.deconv2d(input_, w, output_shape=output_shape,
-                                        strides=[1, d_h, d_w, 1])
-
-            biases = tf.get_variable('biases', [output_shape[-1]], initializer=tf.constant_initializer(0.0))
-            deconv = tf.reshape(tf.nn.bias_add(deconv, biases), deconv.get_shape())
-
-            if with_w:
-                return deconv, w, biases
-            else:
-                return deconv
-
-    def lrelu(self, x, leak=0.2, name="lrelu"):
-        return tf.maximum(x, leak * x)
-
-    def linear(self, input_, output_size, scope=None, stddev=0.02, bias_start=0.0, with_w=False):
-        shape = input_.get_shape().as_list()
-
-        with tf.variable_scope(scope or "Linear"):
-            matrix = tf.get_variable("Matrix", [shape[1], output_size], tf.float32,
-                                     tf.random_normal_initializer(stddev=stddev))
-            bias = tf.get_variable("bias", [output_size],
-                                   initializer=tf.constant_initializer(bias_start))
-            if with_w:
-                return tf.matmul(input_, matrix) + bias, matrix, bias
-            else:
-                return tf.matmul(input_, matrix) + bias
 
     def build_model(self):
         image_dims = [self.image_h, self.image_w, self.c_dim]
@@ -291,12 +323,12 @@ class DCGAN:
                 scope.reuse_variables()
 
             # 直接上来对图片数据就是一个卷积之后激活……太简单粗暴了吧
-            h0 = self.lrelu(self.conv2d(image, self.df_dim, name='d_h0_conv'))
+            h0 = lrelu(conv2d(image, self.df_dim, name='d_h0_conv'))
             # 后面几层归一化一下再卷积
-            h1 = self.lrelu(self.d_bn1(self.conv2d(h0, self.df_dim * 2, name='d_h1_conv')))
-            h2 = self.lrelu(self.d_bn2(self.conv2d(h1, self.df_dim * 4, name='d_h2_conv')))
-            h3 = self.lrelu(self.d_bn3(self.conv2d(h2, self.df_dim * 8, name='d_h3_conv')))
-            h4 = self.linear(tf.reshape(h3, [self.batch_size, -1]), 1, 'd_h4_lin')
+            h1 = lrelu(self.d_bn1(conv2d(h0, self.df_dim * 2, name='d_h1_conv')))
+            h2 = lrelu(self.d_bn2(conv2d(h1, self.df_dim * 4, name='d_h2_conv')))
+            h3 = lrelu(self.d_bn3(conv2d(h2, self.df_dim * 8, name='d_h3_conv')))
+            h4 = linear(tf.reshape(h3, [self.batch_size, -1]), 1, 'd_h4_lin')
 
             return tf.nn.sigmoid(h4), h4
 
@@ -312,30 +344,30 @@ class DCGAN:
             s_h16, s_w16 = self.half(s_h8), self.half(s_w8)
 
             # 通过输入的z构建第一层线性模型
-            self.z_, self.h0_w, self.h0_b = self.linear(
+            self.z_, self.h0_w, self.h0_b = linear(
                 z, self.gf_dim * 8 * s_h16 * s_w16, 'g_h0_lin', with_w=True)
 
             self.h0 = tf.reshape(
-                # 在这里，64*64的1/16为4*4，第三维是128*8=1024
+                # 在这里，64*64的1/16为4*4，第三维是64*8=512
                 self.z_, [-1, s_h16, s_w16, self.gf_dim * 8])
             h0 = tf.nn.relu(self.g_bn0(self.h0))
 
-            self.h1, self.h1_w, self.h1_b = self.deconv2d(
-                # CONV 1，第一次小卷积，结果是8*8*512
+            self.h1, self.h1_w, self.h1_b = deconv2d(
+                # CONV 1，第一次小卷积，结果是8*8*256
                 h0, [self.batch_size, s_h8, s_w8, self.gf_dim * 4], name='g_h1', with_w=True)
             h1 = tf.nn.relu(self.g_bn1(self.h1))
 
-            h2, self.h2_w, self.h2_b = self.deconv2d(
-                # CONV 2，结果是16*16*256
+            h2, self.h2_w, self.h2_b = deconv2d(
+                # CONV 2，结果是16*16*128
                 h1, [self.batch_size, s_h4, s_w4, self.gf_dim * 2], name='g_h2', with_w=True)
             h2 = tf.nn.relu(self.g_bn2(h2))
 
-            h3, self.h3_w, self.h3_b = self.deconv2d(
-                # CONV 3，结果是32*32*128
+            h3, self.h3_w, self.h3_b = deconv2d(
+                # CONV 3，结果是32*32*64
                 h2, [self.batch_size, s_h2, s_w2, self.gf_dim * 1], name='g_h3', with_w=True)
             h3 = tf.nn.relu(self.g_bn3(h3))
 
-            h4, self.h4_w, self.h4_b = self.deconv2d(
+            h4, self.h4_w, self.h4_b = deconv2d(
                 # CONV 4，结果是64*64*3，就是最后的结果图
                 h3, [self.batch_size, s_h, s_w, self.c_dim], name='g_h4', with_w=True)
 
@@ -354,20 +386,20 @@ class DCGAN:
 
             # project `z` and reshape
             h0 = tf.reshape(
-                self.linear(z, self.gf_dim * 8 * s_h16 * s_w16, 'g_h0_lin'),
+                linear(z, self.gf_dim * 8 * s_h16 * s_w16, 'g_h0_lin'),
                 [-1, s_h16, s_w16, self.gf_dim * 8])
             h0 = tf.nn.relu(self.g_bn0(h0, train=False))
 
-            h1 = self.deconv2d(h0, [self.batch_size, s_h8, s_w8, self.gf_dim * 4], name='g_h1')
+            h1 = deconv2d(h0, [self.batch_size, s_h8, s_w8, self.gf_dim * 4], name='g_h1')
             h1 = tf.nn.relu(self.g_bn1(h1, train=False))
 
-            h2 = self.deconv2d(h1, [self.batch_size, s_h4, s_w4, self.gf_dim * 2], name='g_h2')
+            h2 = deconv2d(h1, [self.batch_size, s_h4, s_w4, self.gf_dim * 2], name='g_h2')
             h2 = tf.nn.relu(self.g_bn2(h2, train=False))
 
-            h3 = self.deconv2d(h2, [self.batch_size, s_h2, s_w2, self.gf_dim * 1], name='g_h3')
+            h3 = deconv2d(h2, [self.batch_size, s_h2, s_w2, self.gf_dim * 1], name='g_h3')
             h3 = tf.nn.relu(self.g_bn3(h3, train=False))
 
-            h4 = self.deconv2d(h3, [self.batch_size, s_h, s_w, self.c_dim], name='g_h4')
+            h4 = deconv2d(h3, [self.batch_size, s_h, s_w, self.c_dim], name='g_h4')
 
             return tf.nn.tanh(h4)
 
