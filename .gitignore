@@ -1,0 +1,14 @@
+# Logs
+logs
+*.log
+
+# Runtime data
+.idea
+
+*.png
+*.jpg
+*.jpeg
+*.pyc
+*.meta
+*.index
+checkpoint
